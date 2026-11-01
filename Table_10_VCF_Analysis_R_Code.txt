@@ -1,0 +1,132 @@
+# Base R only. Run: Rscript SCRIPT.R INPUT_VCF_DIRECTORY OUTPUT_DIRECTORY
+# A missing call in the baseline VCF does NOT prove a reference genotype.
+args <- commandArgs(trailingOnly=TRUE)
+# In RStudio, set your working directory to the folder containing the five VCFs,
+# then click Source. Optional: Rscript SCRIPT.R INPUT_DIR OUTPUT_DIR
+if (!(length(args) %in% c(0L, 2L))) stop('Supply either zero or two arguments: INPUT_DIR OUTPUT_DIR')
+input_dir <- if (length(args) == 2L) args[1] else getwd()
+output_dir <- if (length(args) == 2L) args[2] else file.path(input_dir, 'RESULTS_parent_ALS1415')
+dir.create(output_dir, showWarnings=FALSE, recursive=TRUE)
+files <- c(
+  ALS1415='Galaxy83-[SnpEff eff_ on dataset 12 and 69](1).vcf',
+  ALS2875='Galaxy87-[SnpEff eff_ on dataset 12 and 70].vcf',
+  ALS2911='Galaxy71-[SnpEff eff_ on dataset 12 and 66](1).vcf',
+  ALS2913='Galaxy75-[SnpEff eff_ on dataset 12 and 67].vcf',
+  ALS2930='Galaxy79-[SnpEff eff_ on dataset 12 and 68](1).vcf')
+write_tsv <- function(x, filename) write.table(x, file.path(output_dir, filename),
+    sep='\t', quote=TRUE, row.names=FALSE, na='')
+read_vcf <- function(path, strain) {
+  if (!file.exists(path)) stop('Missing input: ',path)
+  lines <- readLines(path, warn=FALSE)
+  h <- which(startsWith(lines, '#CHROM\t'))
+  if (length(h) != 1L) stop('Invalid VCF column header: ',path)
+  col_names <- strsplit(sub('^#','',lines[h]),'\t')[[1]]
+  body <- if (h < length(lines)) lines[(h+1L):length(lines)] else character()
+  body <- body[nzchar(body) & !startsWith(body,'#')]
+  if (!length(body)) stop('No variant records: ',path)
+  v <- read.delim(text=paste(body,collapse='\n'), header=FALSE, sep='\t',
+     quote='', comment.char='', check.names=FALSE, stringsAsFactors=FALSE,
+     colClasses='character')
+  if (ncol(v) != length(col_names)) stop('VCF column mismatch: ',path)
+  names(v) <- col_names
+  if (!all(c('CHROM','POS','REF','ALT','QUAL','INFO','FORMAT') %in% names(v)))
+     stop('Required columns missing: ',path)
+  if (ncol(v) != 10L) stop('Expected one haploid sample: ',path)
+  if (any(grepl(',',v$ALT,fixed=TRUE)) || any(v$ALT %in% c('.','*','<NON_REF>')))
+     stop('Multiallelic or symbolic ALT: split/normalize first: ',path)
+  if (any(is.na(suppressWarnings(as.integer(v$POS)))) || any(suppressWarnings(as.integer(v$POS)) < 1L)) stop('Invalid POS: ',path)
+  q <- suppressWarnings(as.numeric(v$QUAL))
+  if (anyNA(q) || any(!is.finite(q))) stop('Missing or invalid QUAL: ',path)
+  gt <- vapply(strsplit(v[[10]],':',fixed=TRUE),function(x) x[1],character(1))
+  if (any(is.na(gt)) || any(gt != '1')) stop('Unexpected genotype (expected haploid ALT 1): ',path)
+  v$QUAL <- q
+  v$key <- paste(v$CHROM,v$POS,v$REF,v$ALT,sep='|')
+  if (anyDuplicated(v$key)) stop('Duplicate variant identity: ',path)
+  v$strain <- strain
+  v$ANN <- vapply(strsplit(v$INFO,';',fixed=TRUE),function(x) {
+    y <- x[startsWith(x,'ANN=')]
+    if (length(y)) substring(y[1],5) else ''
+  },character(1))
+  v
+}
+
+# Original script corrected: direct VCF import; no na.omit; exact variant key; proper baseline.
+BASELINE <- 'ALS1415'
+EVOLVED <- c('ALS2875','ALS2911','ALS2913','ALS2930')
+
+selected <- c(BASELINE, EVOLVED)
+vcfs <- lapply(selected, function(s) read_vcf(file.path(input_dir,files[[s]]),s))
+names(vcfs) <- selected
+quality_summary <- do.call(rbind,lapply(selected,function(s) {
+  v <- vcfs[[s]]
+  data.frame(strain=s, total=nrow(v), qual_gt_80=sum(v$QUAL>80),
+             qual_le_80=sum(v$QUAL<=80),stringsAsFactors=FALSE)
+}))
+stopifnot(all(quality_summary$total == quality_summary$qual_gt_80 + quality_summary$qual_le_80))
+write_tsv(quality_summary,'quality_summary.tsv')
+# Verify input count expectations from the supplied SnpEff VCFs.
+expected_total <- c(ALS1415=47L, ALS2875=44L, ALS2911=42L, ALS2913=38L, ALS2930=75L)
+expected_high <- c(ALS1415=31L, ALS2875=33L, ALS2911=30L, ALS2913=29L, ALS2930=30L)
+if (any(quality_summary$total != expected_total[quality_summary$strain]) ||
+    any(quality_summary$qual_gt_80 != expected_high[quality_summary$strain])) {
+  stop('Input VCFs or quality counts differ from the verified dataset; review before interpreting results.')
+}
+filtered <- lapply(vcfs,function(v) v[v$QUAL>80,,drop=FALSE])
+base_all <- vcfs[[BASELINE]]
+base_high <- filtered[[BASELINE]]
+results <- list()
+for (s in EVOLVED) {
+  x <- filtered[[s]]
+  # Candidate: high-quality ALT in evolved strain, no identical high-quality ALT in baseline.
+  x <- x[!(x$key %in% base_high$key),,drop=FALSE]
+  x$baseline_status <- ifelse(x$key %in% base_all$key,
+      'BASELINE_CALL_QUAL_LE_80', 'NO_MATCHING_BASELINE_VARIANT_RECORD')
+  x$baseline_qual_if_called <- base_all$QUAL[match(x$key,base_all$key)]
+  x$baseline_evidence <- ifelse(x$baseline_status == 'BASELINE_CALL_QUAL_LE_80',
+    'ALT called in baseline but below quality threshold',
+    'No identical ALT record in baseline VCF; genotype/coverage unknown')
+  x$comparison <- paste0(s,'_vs_',BASELINE)
+  results[[s]] <- x
+  write_tsv(x,paste0(s,'_not_in_',BASELINE,'_QUAL_gt_80.tsv'))
+}
+combined <- do.call(rbind,results)
+row.names(combined) <- NULL
+# Across evolved strains, distinguish truly strain-exclusive calls from shared candidate calls.
+for (s in EVOLVED) combined[[paste0('detected_',s)]] <- combined$key %in% filtered[[s]]$key
+combined$n_evolved_strains_detected <- rowSums(combined[paste0('detected_',EVOLVED)])
+combined$exclusive_to_one_evolved_strain <- combined$n_evolved_strains_detected == 1L
+write_tsv(combined,'all_candidate_rows_with_sharing.tsv')
+# One row per candidate allele, with flags for which evolved strains contain it.
+unique_candidates <- combined[!duplicated(combined$key),,drop=FALSE]
+write_tsv(unique_candidates,'distinct_candidate_alleles_with_sharing.tsv')
+comparison_summary <- do.call(rbind,lapply(EVOLVED,function(s) {
+  x <- results[[s]]
+  data.frame(evolved=s,baseline=BASELINE,candidate_count=nrow(x),
+    baseline_low_quality_match=sum(x$baseline_status=='BASELINE_CALL_QUAL_LE_80'),
+    no_baseline_variant_record=sum(x$baseline_status=='NO_MATCHING_BASELINE_VARIANT_RECORD'))
+}))
+write_tsv(comparison_summary,'comparison_summary.tsv')
+# Verify the expected comparison counts from independent parsing of these VCFs.
+expected_candidates <- c(ALS2875=9L, ALS2911=2L, ALS2913=2L, ALS2930=4L)
+if (any(comparison_summary$candidate_count != expected_candidates[comparison_summary$evolved])) {
+  stop('Candidate counts do not match independently verified values; investigate input data and representation.')
+}
+# Check that each candidate is genuinely excluded from the filtered baseline.
+stopifnot(all(vapply(results, function(x) !any(x$key %in% base_high$key), logical(1))))
+writeLines(c(
+  paste('Baseline:',BASELINE),
+  paste('Evolved strains:',paste(EVOLVED,collapse=', ')),
+  'All comparisons use exact CHROM, POS, REF, ALT identity and QUAL strictly >80.',
+  'A candidate means an evolved high-quality ALT call has NO matching baseline high-quality ALT call.',
+  'BASELINE_CALL_QUAL_LE_80 means the same ALT is present in baseline raw VCF but fails quality threshold.',
+  'NO_MATCHING_BASELINE_VARIANT_RECORD means no same ALT record in baseline VCF; it does NOT mean confirmed reference genotype.',
+  'No BAM-level confirmation of baseline reference genotype or adequate depth has been performed.',
+  'Indels have not been left-normalized: normalize all VCFs against the SAME reference FASTA before biological interpretation.',
+  'These scripts assume each VCF contains one haploid ALT allele per record and reject unexpected formats.',
+  'Quality and comparison count checks are specific to the five supplied VCF files.',
+  'ANN contains the complete SnpEff annotation; one variant can have multiple effects.',
+  'Candidate variants are NOT established de novo or confirmed evolution-associated mutations.'
+),file.path(output_dir,'READ_ME_LIMITATIONS.txt'))
+print(quality_summary)
+print(comparison_summary)
+cat('Saved outputs to:',normalizePath(output_dir),'\n')
